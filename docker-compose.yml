@@ -1,0 +1,78 @@
+name: rag-fastapi
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: rag_fastapi
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports: ["127.0.0.1:55433:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rag_fastapi"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["127.0.0.1:6380:6379"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  migrate:
+    build: .
+    profiles: ["app"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/rag_fastapi
+    command: ["python", "-m", "app.migrate"]
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    build: .
+    profiles: ["app"]
+    env_file: .env
+    environment: &app_environment
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/rag_fastapi
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QDRANT_URL: http://qdrant:6333
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+  worker:
+    build: .
+    profiles: ["app"]
+    env_file: .env
+    environment: *app_environment
+    command: ["arq", "app.worker.WorkerSettings"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+  qdrant:
+    image: qdrant/qdrant:v1.17.0
+    profiles: ["rag"]
+    ports: ["127.0.0.1:6334:6333"]
+    volumes: ["qdrant_data:/qdrant/storage"]
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.8
+    profiles: ["rag"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["127.0.0.1:9201:9200"]
+    volumes: ["elasticsearch_data:/usr/share/elasticsearch/data"]
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  elasticsearch_data:
