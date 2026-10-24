@@ -299,6 +299,338 @@ These are actual repository paths in place of the requested placeholders.
 
 **Read the request flow in this order:** route → dependency injection → service → search/provider → repository. `self.repository` is injected by `open_resources()`; it is an instance of this project's `Repository`, not a built-in FastAPI object.
 
+## 📖 Read the implementation as a function-by-function story
+
+Read the following sequences with the linked files open. Each step explains **what comes in, what the function does, and where execution goes next**. The main path uses the default PostgreSQL search backend; the optional external search path is explained separately.
+
+### Before either flow: where do the service objects come from?
+
+Start at [`create_app()` in app/main.py](app/main.py). It registers the HTTP routes and defines a `lifespan()` function. When FastAPI starts, `lifespan()` enters [`open_resources()` in app/resources.py](app/resources.py).
+
+`open_resources()` opens PostgreSQL, Redis, and HTTP connections. It then constructs the objects that the routes will use:
+
+```python
+repository = Repository(pool)
+search = SearchService(settings, repository, client)
+# embeddings and llm are selected from the configured providers.
+documents = DocumentsService(repository, redis, settings)
+query = QueryService(search, embeddings, llm)
+```
+
+These lines summarize the construction in `open_resources()`; the actual service constructors appear inside its `Resources(...)` return value. FastAPI saves that resource container on `app.state.resources`.
+
+**Connect the names:** when you see `self.repository.create(...)` inside `DocumentsService`, `self.repository` is the `Repository(pool)` object created here. When you see `self.embeddings.embed(...)` inside `QueryService`, `self.embeddings` is the embedding provider injected here. The constructors store those objects so later methods can use them.
+
+The ARQ worker is a separate process. Its [`startup()` function](app/workers/ingestion.py) also enters `open_resources()` and stores the resulting container in `ctx["resources"]`. The API and worker therefore use the same construction code, but have separate Python objects and connections.
+
+### 📥 Ingestion: follow a file from upload to searchable chunks
+
+> **Starting situation:** You upload `refund-policy.pdf`. We will follow the normal successful path first. Keep [the document routes](app/api/routes/documents.py), [document service](app/services/documents.py), and [worker](app/workers/ingestion.py) open.
+
+#### 1. Start at `upload_document()` — receive the HTTP upload
+
+Open [`app/api/routes/documents.py`](app/api/routes/documents.py) and find `upload_document()`.
+
+A request to `POST /api/documents/upload` reaches this route after FastAPI resolves its dependencies and validates its input. [`authorize()`](app/api/dependencies.py) checks the configured API key and rate limit. `get_documents()` returns `request.app.state.resources.documents`, so the route's `service` parameter is the `DocumentsService` object created at startup.
+
+The route receives an uploaded file and optional source label. It calls:
+
+```python
+return await service.upload(file, source.strip() if source else source)
+```
+
+**Go next:** `DocumentsService.upload()` in `app/services/documents.py`.
+
+#### 2. `DocumentsService.upload()` — read and check the file
+
+Open [`app/services/documents.py`](app/services/documents.py) and find `upload()`.
+
+This function reads the uploaded bytes, closes the upload handle, checks the file-size limit, and checks the filename. It then asks another function to turn those bytes into readable text:
+
+```python
+content, mime_type = await asyncio.to_thread(
+    extract_file, data, filename, file.content_type or ""
+)
+```
+
+`asyncio.to_thread()` runs file parsing in a thread while this coroutine waits for the result.
+
+**Go next:** `extract_file()` in `app/services/ingestion.py`. After extraction, execution returns to `upload()`.
+
+#### 3. `extract_file()` — turn file bytes into text
+
+Open [`app/services/ingestion.py`](app/services/ingestion.py) and find `extract_file()`.
+
+This function selects a parser using the MIME type or file extension. For this PDF, it uses `PdfReader` and collects the text from its pages. It rejects files with no readable text and returns two values: extracted text and MIME type.
+
+Back in `DocumentsService.upload()`, those values are passed to:
+
+```python
+return await self.create(filename, mime_type, content, source)
+```
+
+**Go next:** `DocumentsService.create()` in the same service file. Here, `self.create()` means “call another method on this same service object.”
+
+> **Alternate entry: already have text?** `POST /api/documents` starts at `create_document()` in [the document routes](app/api/routes/documents.py). It validates a `CreateDocument` body and calls `service.create(...)` directly. It skips `upload()` and `extract_file()`, then joins the sequence below.
+
+#### 4. `DocumentsService.create()` → `Repository.create()` — save the document first
+
+In [`DocumentsService.create()`](app/services/documents.py), the first call is:
+
+```python
+document = await self.repository.create(filename, mime_type, content, source)
+```
+
+Follow it into [`Repository.create()` in app/db/repository.py](app/db/repository.py). This method inserts a row into `documents`, stores the extracted text in `raw_text`, and sets the initial status to `queued`. PostgreSQL returns the inserted row.
+
+The helper `document_response(row)` converts that database row into a `DocumentResponse`, including its ID and status. That object returns to `DocumentsService.create()`.
+
+**Go next:** back to `DocumentsService.create()`, immediately after the repository call. The document is now stored, but it has no searchable chunks yet.
+
+#### 5. `DocumentsService.create()` → `redis.enqueue_job()` — hand work to the queue
+
+The service now calls the ARQ Redis client's `enqueue_job()` with the job name `"process_document"` and the document ID.
+
+Only the ID needs to travel through the queue because the full text is already in PostgreSQL. The service returns the previously created `DocumentResponse`, and the HTTP route sends it to the client with status **201**. That response reports `queued`; it does not wait for ingestion to finish.
+
+**Go next:** the ARQ worker picks up the job and invokes `process_document(ctx, document_id)`.
+
+> **Important connection:** `enqueue_job()` does not directly call the Python worker function. Redis connects two separate processes. The worker may start before or after the upload response reaches the client; the API does not await completion of the job.
+
+#### 6. `process_document()` — load the saved document and begin processing
+
+Open [`app/workers/ingestion.py`](app/workers/ingestion.py) and find `process_document()`.
+
+The function gets its dependencies from `ctx["resources"]`, converts the ID to a UUID, and acquires a PostgreSQL connection. It takes an advisory lock so duplicate jobs do not process the same document at the same time.
+
+It reads `status` and `raw_text` from PostgreSQL. If the document is missing or already completed, it stops. Otherwise, it calls [`Repository.set_status()`](app/db/repository.py) to change the status to `processing`.
+
+**Go next:** still inside `process_document()`, follow the call to `clean_text()` and then `chunk_text()`.
+
+#### 7. `clean_text()` → `chunk_text()` — prepare smaller passages
+
+Open [`app/services/ingestion.py`](app/services/ingestion.py).
+
+`clean_text()` receives the saved text and normalizes whitespace, line endings, and null characters. Its returned string becomes the input to `chunk_text()`.
+
+`chunk_text()` uses `SentenceSplitter` to divide that string into overlapping passages. It returns a list of dictionaries with `chunk_index`, `content`, and `token_count`.
+
+Back in the worker, this happens through:
+
+```python
+chunks = await asyncio.to_thread(chunk_text, clean_text(row["raw_text"] or ""))
+```
+
+Python evaluates `clean_text(...)` first; `chunk_text(...)` then runs in the thread. If no chunks are produced, the worker raises an error.
+
+**Go next:** return to the `for chunk in chunks` loop inside `process_document()`.
+
+#### 8. `embeddings.embed()` — give each chunk a vector
+
+For each chunk, the worker calls:
+
+```python
+chunk["embedding"] = await resources.embeddings.embed(chunk["content"])
+```
+
+Follow the selected implementation in [`app/integrations/providers.py`](app/integrations/providers.py):
+
+- With defaults, `FakeEmbeddingProvider.embed()` computes a deterministic local test vector.
+- With a remote provider, `OpenAICompatibleProvider.embed()` calls its `post()` helper for `/embeddings`, then `validate_vector()` checks the returned vector.
+
+The returned list of numbers is added to the same chunk dictionary under `embedding`. This loop processes chunks one at a time.
+
+**Go next:** after all chunks have vectors, the worker calls `Repository.replace_chunks()`.
+
+#### 9. `Repository.replace_chunks()` — store text and vectors together
+
+Open [`app/db/repository.py`](app/db/repository.py) and find `replace_chunks()`.
+
+The worker passes its connection, the document ID, and the completed chunk dictionaries. Inside a transaction, this function deletes existing chunks for that document and inserts the new chunks, including their text and embeddings.
+
+PostgreSQL maintains the indexes defined by the migration as those rows are written. If the transaction fails, the replacement is rolled back.
+
+**Go next:** return to the worker, which calls `resources.search.sync_document(document_uuid)`.
+
+#### 10. `SearchService.sync_document()` — update optional external indexes
+
+Open [`app/services/search.py`](app/services/search.py) and find `sync_document()`.
+
+With the default PostgreSQL backend, this function returns immediately because the chunks and vectors are already in the search database.
+
+With `qdrant-elasticsearch`, it calls `ensure_indexes()`, loads chunks through `Repository.indexed_chunks()`, removes old external entries for the document, and writes vectors to Qdrant and text to Elasticsearch. Its `json_request()` helper calls `request()` to send HTTP requests and checks the responses.
+
+**Go next:** after synchronization succeeds, execution returns to `process_document()`.
+
+#### 11. `Repository.set_status()` — make the document eligible for retrieval
+
+The worker calls `set_status(document_uuid, "completed")`. Both default database searches and external-hit hydration require this completed status, so the document can now appear in query results.
+
+The worker releases the advisory lock in its `finally` block and finishes the job.
+
+To observe progress, the client calls `GET /api/documents/{document_id}`. Follow [`find_document()`](app/api/routes/documents.py) → [`DocumentsService.find()`](app/services/documents.py) → [`Repository.find()`](app/db/repository.py) → `document_response()`. This path returns metadata and the current status; it does not run ingestion again.
+
+**If something fails:** `process_document()` marks ordinary processing failures as `failed` and schedules retries while attempts remain. If the initial queue submission failed, `dispatch_queued()` calls `Repository.queued_ids()` and re-enqueues saved queued documents. These are recovery paths around the main sequence.
+
+```text
+upload_document()
+  -> DocumentsService.upload()
+     -> extract_file() -> returns text
+     -> DocumentsService.create()
+        -> Repository.create() -> document_response() -> returns document
+        -> redis.enqueue_job() -> API returns queued response
+
+        ... Redis / separate ARQ worker ...
+
+process_document()
+  -> Repository.set_status("processing")
+  -> clean_text() -> chunk_text()
+  -> embeddings.embed() for each chunk
+  -> Repository.replace_chunks()
+  -> SearchService.sync_document()
+  -> Repository.set_status("completed")
+```
+
+### 📤 User query: follow a question from request to answer
+
+> **Starting situation:** The policy has completed ingestion. The user asks, “Can I request a refund after 20 days?” Keep [the query route](app/api/routes/query.py), [retrieval service](app/services/retrieval.py), and [search service](app/services/search.py) open.
+
+#### 1. Start at `query()` — receive the question
+
+Open [`app/api/routes/query.py`](app/api/routes/query.py) and find the route function `query()`.
+
+A request to `POST /api/query` supplies a `QueryInput` body. FastAPI resolves dependencies and validates the input. [`authorize()`](app/api/dependencies.py) checks access and throttling, while `get_query()` supplies the `QueryService` from `app.state.resources.query`.
+
+The route calls:
+
+```python
+return await service.query(body.question)
+```
+
+**Go next:** `QueryService.query()` in `app/services/retrieval.py`. The route function and service method share a name, but are different functions in different files.
+
+#### 2. `QueryService.query()` → `embeddings.embed()` — represent the question numerically
+
+Open [`app/services/retrieval.py`](app/services/retrieval.py) and find the `QueryService` class.
+
+Its `query()` method receives the original question string and calls:
+
+```python
+embedding = await self.embeddings.embed(question)
+```
+
+This goes to the same configured provider implementation used for document chunks: [`FakeEmbeddingProvider.embed()` or `OpenAICompatibleProvider.embed()`](app/integrations/providers.py). A remote embedding goes through `post()` and `validate_vector()` before returning.
+
+**Go next:** return to `QueryService.query()` with the query vector. The original question is still available in the `question` variable.
+
+#### 3. `QueryService.query()` → two `SearchService` methods — start both searches
+
+The service uses `asyncio.gather()` to await two searches concurrently:
+
+```python
+vector, keyword = await asyncio.gather(
+    self.search.vector_search(embedding),
+    self.search.keyword_search(question),
+)
+```
+
+The first receives the numerical vector. The second receives the original text. Neither search waits for the other search to finish before starting.
+
+**Go next:** read both methods in [`app/services/search.py`](app/services/search.py). Steps 4 and 5 below explain these parallel branches separately.
+
+#### 4. `SearchService.vector_search()` → `Repository.vector_search()` — find similar meanings
+
+With the default backend, `SearchService.vector_search()` passes the vector and limit to [`Repository.vector_search()`](app/db/repository.py).
+
+The repository executes SQL that compares the query vector with stored chunk vectors using cosine distance. It joins the document table, keeps only completed documents, orders by smallest distance, and returns up to 10 rows.
+
+The helper `retrieved()` turns each row into a `RetrievedChunk` object, preserving its text, filename, document ID, chunk index, and score. The list returns through `SearchService` to `QueryService`.
+
+**Return value:** the `vector` list. No answer has been generated yet.
+
+#### 5. `SearchService.keyword_search()` → `Repository.keyword_search()` — find matching words
+
+In parallel, `SearchService.keyword_search()` passes the question and limit to [`Repository.keyword_search()`](app/db/repository.py).
+
+The repository converts the question into a PostgreSQL full-text query, matches stored chunk search vectors, and ranks matches with `ts_rank_cd`. It also restricts results to completed documents and returns up to 10 rows.
+
+Again, `retrieved()` converts rows into `RetrievedChunk` objects. The list returns to `QueryService` as `keyword`.
+
+**Go next:** once both lists have returned, `asyncio.gather()` finishes and `QueryService.query()` calls `merge_hybrid_results(vector, keyword)`.
+
+> **External-backend detour:** If external search is enabled, the two `SearchService` methods send requests to Qdrant and Elasticsearch through `json_request()` → `request()`. They pass returned IDs and scores to `Repository.hydrate()`, which loads current chunk text and filters by completed-document status. The resulting lists rejoin the same fusion step below.
+
+#### 6. `merge_hybrid_results()` — combine the two lists
+
+Stay in [`app/services/retrieval.py`](app/services/retrieval.py) and find `merge_hybrid_results()`.
+
+This function walks each ranked list. For each chunk, it uses `(documentId, chunkIndex)` as the identity and adds `1 / (60 + rank)` to its fusion score. If both searches found the same chunk, it keeps one result with contributions from both branches.
+
+It sorts the merged results and returns up to five `HybridResult` objects.
+
+**Go next:** back in `QueryService.query()`, that list becomes `results`, and the next call is `build_context(results)`.
+
+#### 7. `build_context()` — turn results into readable evidence
+
+Find `build_context()` in [`app/services/retrieval.py`](app/services/retrieval.py).
+
+The function takes ranked chunks and builds a text block. It puts `[source:1]`, `[source:2]`, and similar markers before included passages. It also builds a `ContextSource` record for each included passage, containing its document ID, filename, chunk index, and snippet.
+
+It stops when the next passage would exceed the soft character budget after the first passage. It returns a `BuiltContext` object with two fields:
+
+- `text`: the readable evidence to send to the model.
+- `sources`: metadata to return to the client.
+
+**Go next:** `QueryService.query()` receives this object as `context` and calls `self.llm.generate(question, context.text)`.
+
+#### 8. `llm.generate()` — ask the model to write the answer
+
+Open [`app/integrations/providers.py`](app/integrations/providers.py).
+
+With a real provider, `OpenAICompatibleProvider.generate()` constructs a prompt containing the original question and the retrieved text. It adds system instructions about grounding and source markers, then calls its `post()` helper with `/chat/completions`.
+
+`post()` sends the HTTP request, raises an error for an unsuccessful response, and returns decoded JSON. Back in `generate()`, the method extracts `choices[0].message.content`, checks that it is nonempty text, and returns that answer string.
+
+With defaults, execution instead enters `FakeLlmProvider.generate()`, which returns a template or an insufficient-context message without calling a remote model.
+
+**Go next:** the answer string returns to `QueryService.query()`.
+
+#### 9. `QueryService.query()` → route `query()` — build and return the response
+
+At the end of [`QueryService.query()`](app/services/retrieval.py), the service constructs:
+
+```python
+QueryResponse(
+    question=question,
+    answer=answer,
+    sources=context.sources,
+    debug=QueryDebug(results=results, context=context),
+)
+```
+
+This object returns to the route's waiting `await service.query(...)`. The route returns it to FastAPI, which serializes the response as JSON with status **201**.
+
+The user now receives the answer and its source metadata. This request has read existing chunks; it has not uploaded, split, or re-embedded the stored documents.
+
+```text
+route query()
+  -> QueryService.query()
+     -> embeddings.embed(question)
+     -> asyncio.gather(
+          SearchService.vector_search()
+            -> Repository.vector_search() -> retrieved(),
+          SearchService.keyword_search()
+            -> Repository.keyword_search() -> retrieved()
+        )
+     -> merge_hybrid_results()
+     -> build_context()
+     -> llm.generate(question, context.text)
+     -> construct QueryResponse
+  -> FastAPI serializes JSON -> user receives answer
+```
+
+> **Learning checkpoint:** Follow one chunk's `content` field. During ingestion it moves from `extract_file()` to `chunk_text()` to `Repository.replace_chunks()`. During querying it comes back through `Repository.vector_search()` or `keyword_search()`, passes through fusion and `build_context()`, and reaches `llm.generate()`. That stored text connects the two workflows.
+
 ## Operational behavior behind the diagram
 
 | Concern | Implemented behavior and practical limit |
